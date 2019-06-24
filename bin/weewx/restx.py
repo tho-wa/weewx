@@ -1310,6 +1310,212 @@ class CWOPThread(RESTThread):
                     "restx: %s: Exception %s (%s) when looking for response to %s packet" %
                     (self.protocol_name, type(e), e, dbg_msg))
                 return
+              
+              
+
+# ==============================================================================
+#                    WetternetzSachsen
+# ==============================================================================
+
+class WetternetzSachsen(StdRESTful): 
+"""Upload data to the Wetternetz Sachsen (Saxony - Germany) using protocol WNS V2.1 
+
+To enable this module, add the following to weewx.conf: 
+  
+     [StdRESTful] 
+         [[WetternetzSachsen]] 
+             enable   = True 
+             username = StationsID [WNSxxx] 
+             password = Stationskennung [DirectPost Password] 
+      
+     The WetternetzSachsen-server expects a single string of values delimited by 
+     semicolons. The position of each value matters, for example position 1 
+     is the StationsID and position 2 is the Stationskennung [DirectPost Password]. 
+
+For details of the Wetternetz Sachsen V2.1 protocol and further position of values for the string see 
+http://www.wetternetz-sachsen.de/download/parameterliste_%20wns_21.txt
+
+# The URL used by Wetternetz Sachsen: 
+archive_url = "http://www.wetternetz-sachsen.de/get_daten_21.php" 
+
+"""
+
+def __init__(self, engine, config_dict): 
+         super(StdWetternetzSachsen, self).__init__(engine, config_dict) 
+ 
+         site_dict = get_site_dict( 
+             config_dict, 'WetternetzSachsen', 'station', 'password') 
+         if site_dict is None: 
+             return 
+
+ 	site_dict.setdefault('language', 'de')
+
+         # Get the manager dictionary: 
+        site_dict['manager_dict'] = weewx.manager.get_manager_dict_from_config( 
+             config_dict, 'wx_binding') 
+ 
+	self.archive_queue = Queue.Queue() 
+         self.archive_thread = WetternetzSachsenThread(self.archive_queue, **site_dict) 
+         self.archive_thread.start() 
+         self.bind(weewx.NEW_ARCHIVE_RECORD, self.new_archive_record) 
+         syslog.syslog(syslog.LOG_INFO, "restx: WetternetzSachsen: " 
+                                        "Data will be uploaded for user %s" % 
+                       site_dict['username']) 
+ 
+ 
+     def new_archive_record(self, event): 
+         self.archive_queue.put(event.record) 
+ 
+class WetternetzSachsenThread(RESTThread): 
+"""Concrete class for threads posting from the archive queue, 
+        using the WetternetzSachsen V2.1 protocol.""" 
+     _SERVER_URL = 'http://www.wetternetz-sachsen.de/get_daten_21.php' 
+      
+     def __init__(self, queue, username, password, 
+                  manager_dict, 
+                  language='de', server_url=_SERVER_URL, 
+                  post_interval=300, max_backlog=sys.maxint, stale=None, 
+                  log_success=True, log_failure=True, 
+                  timeout=60, max_tries=3, retry_wait=5, retry_login=1800, skip_upload=False): 
+
+         """Initialize an instances of WetternetzSachsenThread. 
+  
+         Parameters specific to this class: 
+           username: StationsID [WNSxxx] 
+           password: Stationskennung [DirectPost Password]
+           manager_dict: A dictionary holding the database manager 
+           information. It will be used to open a connection to the archive  
+           database. 
+           server_url: URL of the server 
+           No need to change, Default is the WetternetzSachsen getdaten-php-file 
+  
+         Parameters customized for this class: 
+  
+           post_interval: The interval in seconds between posts. The usual upload interval is 300 seconds. So default is set to 300. Intervals between 60 and 3600 seconds are possible but useful are only intervals less than 900 seconds.  """ 
+ 
+         super(WetternetzSachsenThread, self).__init__(queue, 
+                                            protocol_name='WetternetzSachsen', 
+                                            manager_dict=manager_dict, 
+                                            post_interval=post_interval, 
+                                            max_backlog=max_backlog, 
+                                            stale=stale, 
+                                            log_success=log_success, 
+                                            log_failure=log_failure, 
+                                            timeout=timeout, 
+                                            max_tries=max_tries, 
+                                            retry_wait=retry_wait, 
+                                            retry_login=retry_login, 
+                                            skip_upload=skip_upload) 
+         self.username = username 
+         self.password = password 
+         self.server_url = server_url 
+
+     def get_record(self, record, dbmanager): 
+         # Get the record from my superclass 
+         r = super(WetternetzSachsenThread, self).get_record(record, dbmanager) 
+ 
+     def process_record(self, record, dbmanager): 
+         r = self.get_record(record, dbmanager) 
+         url = self.get_url(r) 
+         if self.skip_upload: 
+             raise AbortedPost("Skip post") 
+         req = urllib2.Request(url) 
+         req.add_header("User-Agent", "weewx/%s" % weewx.__version__) 
+         self.post_with_retries(req) 
+ 
+     def check_response(self, response): 
+"""Check the HTTP response code for an Ambient related error."""
+         for line in response: 
+             if line.startswith("Benutzer/Passwort Fehler"): 
+                 raise BadLogin(line) 
+             elif not line.startswith('OK'): 
+                 raise FailedPost("server returned '%s'" % line) 
+ 
+     def get_url(self, in_record): 
+ 
+         # Convert to units required by WetternetzSachsen 
+         record = weewx.units.to_METRIC(in_record) 
+ 
+         # assemble an array of values in the proper order 
+         values = [self.username] 
+	 values = [self.password]
+        values.append('WNS V2.1')  # TMPVER 
+	values.append('WeeWx')  # WSOVER 
+	time_tt = time.gmtime(record['dateTime']) 
+	values.append(time.strftime("%H:%M", time_tt)) # ZEIT__
+        values.append(time.strftime("%d.%m.%Y", time_tt)) # DATUM_ 
+	values.append('-1')  # UTCDIF
+        values.append('$current.outTemp')  # T2AKT_
+        values.append('$day.outTemp.min')  # T2MIN_
+        values.append('$day.outTemp.max')  # T2MAX_
+        values.append('$span($hour_delta=1).outTemp')  # T2D1H_
+        values.append('$current.extraTemp1')  # T5AKT_
+        values.append('$current.extraTemp1')  # T5MIN_
+	values.append('$current.outHumidity'))  # LFAKT_
+	values.append('$span($time_delta=300).rain.sum') # RRD05_
+	values.append('$span($time_delta=600).rain.sum') # RRD10_
+	values.append('$span($hour_delta=1).rain.sum') # RRD1H_
+	values.append('$span($hour_delta=3).rain.sum') # RRD3H_
+	values.append('$span($hour_delta=24).rain.sum') # RRD24H
+        values.append('$day.rain.sum')  # RRD1D_
+        values.append('$current.wind')  # WSAKT_
+        values.append('$current.windDir')  # WRAKT_
+        values.append('$current.windGust')  # WBAKT_
+        values.append('$span($time_delta=600).wind.avg')  # WSM10_
+        values.append('$span($time_delta=600).windDir.avg')  # WRM10_
+        values.append('$span($hour_delta=1).wind.max')  # WSMX1H
+        values.append('$day.wind.max')  # WSMX1D
+        values.append('$day.windGust.max')  # WBMX1D
+        values.append('$current.chill')  # WCAKT_   ????????????
+	values.append('$span($hour_delta=1).chill.min') # WCMN1H  ??????????
+        values.append('$day.chill.min')  # WCMN1D  ??????????
+        values.append('$current.barometer')  # LDAKT_
+        values.append('$current.pressure')  # LDABS_
+	values.append('$span($hour_delta=1).barometer') # LDD1H_
+	values.append('$span($hour_delta=3).barometer') # LDD3H_
+	values.append('$span($hour_delta=24).barometer') # LDD24H
+        values.append('$day.ET.sum')  # EVA1D_ 
+        values.append('--')  # SOD1H_
+        values.append('--')  # SOD1D_
+        values.append('--')  # BEDGRA
+        values.append('$current.radiation')  # SSAKT_
+	values.append('$span($hour_delta=1).radiation') # SSMX1H
+        values.append('$day.radiation.max')  # SSMX1D
+        values.append('$current.UV')  # UVINDX
+        values.append('$day.UV.max')  # UVMX1D
+        values.append('--')  # WOLKUG
+        values.append('--')  # SIWEIT
+        values.append('--')  # SNEHOE
+        values.append('--')  # SNEDAT
+        values.append('--')  # SNEFGR
+        values.append('$span($month_delta=1).outTemp.avg')  # T2M1M_
+        values.append('--')  # T2M1MA
+        values.append('--')  # RRDATU
+        values.append('$yesterday.rain.sum')  # RRGEST
+        values.append('$month.rain.sum')  # RRD1M_
+        values.append('--')  # RRD1MR
+        values.append('$year.rain.sum')  # RRD1A_
+        values.append('--')  # RRD1AR
+        values.append('$month.ET.sum')  # EVAD1M
+        values.append('$year.ET.sum')  # EVAD1A
+        values.append('--')  # SOD1M_
+        values.append('--')  # SOD1A_
+        values.append('--')  # SOD1AR
+        values.append('--')  # KLTSUM
+        values.append('--')  # WRMSUM
+        values.append('--')  # GRASUM
+        values.append('--')  # GRADAT
+
+
+
+ 
+         valstr = ';'.join(values) 
+         url = self.server_url + '?val=' + valstr 
+         # show the url in the logs for debug, but mask any credentials 
+         if weewx.debug >= 2: 
+             syslog.syslog(syslog.LOG_DEBUG, 'restx: WetternetzSachsen: url: %s' % 
+                           re.sub(m.hexdigest(), "XXX", url)) 
+         return url 
 
 
 # ==============================================================================
